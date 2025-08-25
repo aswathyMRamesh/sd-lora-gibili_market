@@ -12,8 +12,6 @@ Add a new style token <sks> to the tokenizer.
 
 Finetune both the UNet and the text encoder with LoRA so that the prompt: "a busy market, in <sks> style" produces Ghibli-like images.
 
-Submit runnable code (with clear instructions on how to run the scripts) and the resulting LoRA weights.
-
 3 · IMPLEMENTATION REQUIREMENTS
 Libraries: diffusers, peft, PyTorch 2+, safetensors
 
