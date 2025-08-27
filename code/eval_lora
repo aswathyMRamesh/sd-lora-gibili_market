@@ -1,0 +1,200 @@
+# code/eval_lora.py
+import os, argparse, inspect
+from dataclasses import dataclass
+from typing import Tuple, Dict
+
+import torch
+from safetensors.torch import load_file
+from diffusers import StableDiffusionPipeline
+from transformers import AutoTokenizer
+from peft import LoraConfig as PeftLoraConfig, get_peft_model
+from diffusers import DPMSolverMultistepScheduler
+
+@dataclass
+class Args:
+    model_name_or_path: str = "runwayml/stable-diffusion-v1-5"
+    tokenizer_dir: str = "./artifacts/tokenizer"
+    lora_path: str = "./lora_out/pytorch_lora_weights.safetensors"
+    prompt: str = "a busy market, in <sks> style"
+    negative_prompt: str = ""
+    num_images: int = 3
+    guidance: float = 7.5
+    steps: int = 30
+    height: int = 512
+    width: int = 512
+    output_dir: str = "./samples"
+    seed: int = 1234
+    float16: bool = True
+    local_files_only: bool = True
+
+def parse_args() -> Args:
+    p = argparse.ArgumentParser()
+    for f, field in Args.__dataclass_fields__.items():
+        t = field.type
+        if t is bool:
+            p.add_argument(f"--{f}", action="store_true")
+        else:
+            p.add_argument(f"--{f}")
+    ns = p.parse_args()
+    d = Args().__dict__.copy()
+    for k, v in vars(ns).items():
+        if v is not None:
+            if isinstance(d[k], int): v = int(v)
+            if isinstance(d[k], float): v = float(v)
+            d[k] = v
+    return Args(**d)
+
+def wrap_with_lora_te_and_unet(pipe: StableDiffusionPipeline, rank: int = 8):
+    te_cfg = PeftLoraConfig(
+        r=rank, lora_alpha=rank, lora_dropout=0.0,
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        bias="none", task_type="FEATURE_EXTRACTION",
+    )
+    pipe.text_encoder = get_peft_model(pipe.text_encoder, te_cfg)
+
+    unet_cfg = PeftLoraConfig(
+        r=rank, lora_alpha=rank, lora_dropout=0.0,
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        bias="none", task_type="FEATURE_EXTRACTION",
+    )
+    pipe.unet = get_peft_model(pipe.unet, unet_cfg)
+
+    # Robust UNet forward adapter:
+    base_unet = getattr(pipe.unet, "model", None) or getattr(pipe.unet, "base_model", None) or pipe.unet
+    base_sig = inspect.signature(base_unet.forward)
+    valid = set(base_sig.parameters.keys())
+
+    def _pop_any(d, keys):
+        for k in keys:
+            if k in d:
+                return d.pop(k)
+        return None
+
+    def safe_forward(*args, **kwargs):
+        # Prefer grabbing from kwargs first (diffusers commonly uses kwargs),
+        # but also fill from positional args if missing.
+        sample = _pop_any(kwargs, ["sample", "x", "hidden_states", "latent_model_input"])
+        timestep = _pop_any(kwargs, ["timestep", "timesteps", "t"])
+        encoder_hidden_states = _pop_any(kwargs, ["encoder_hidden_states", "context", "encoder_states"])
+
+        # Fill from positional args if any are still missing
+        if sample is None and len(args) >= 1: sample = args[0]
+        if timestep is None and len(args) >= 2: timestep = args[1]
+        if encoder_hidden_states is None and len(args) >= 3: encoder_hidden_states = args[2]
+
+        # If still missing, raise a clear error instead of calling with the wrong signature
+        if sample is None or timestep is None or encoder_hidden_states is None:
+            # As a very last resort, try the original call untouched
+            try:
+                return base_unet(*args, **kwargs)
+            except TypeError as e:
+                raise RuntimeError(
+                    f"UNet forward arg parsing failed. "
+                    f"Got args={tuple(type(a).__name__ for a in args)}, "
+                    f"kwargs keys={list(kwargs.keys())}. Original error: {e}"
+                )
+
+        clean = {k: v for k, v in kwargs.items() if k in valid}
+        return base_unet(sample, timestep, encoder_hidden_states, **clean)
+
+    pipe.unet.forward = safe_forward  # type: ignore
+
+def load_split_lora_weights(lora_path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    sd = load_file(lora_path, device="cpu")
+    te_state, unet_state = {}, {}
+    for k, v in sd.items():
+        if k.startswith("text_encoder."):
+            te_state[k[len("text_encoder."):]] = v
+        elif k.startswith("unet."):
+            unet_state[k[len("unet."):]] = v
+    return te_state, unet_state
+
+@torch.no_grad()
+def encode_prompts_with_peft_te(pipe: StableDiffusionPipeline,
+                                tokenizer: AutoTokenizer,
+                                prompt: str,
+                                negative_prompt: str,
+                                device: str,
+                                dtype: torch.dtype):
+    pos = tokenizer([prompt], padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True, return_tensors="pt")
+    neg = tokenizer([negative_prompt] if negative_prompt else [""],
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True, return_tensors="pt")
+
+    peft_te = pipe.text_encoder
+    base_te = getattr(peft_te, "get_base_model", lambda: peft_te)()
+    if hasattr(base_te, "base_model"):
+        base_te = base_te.base_model
+    base_te = base_te.to(device=device, dtype=dtype)
+
+    prompt_embeds = base_te(input_ids=pos.input_ids.to(device))[0]
+    negative_embeds = base_te(input_ids=neg.input_ids.to(device))[0]
+    return prompt_embeds, negative_embeds
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    dtype = torch.float16 if args.float16 and torch.cuda.is_available() else torch.float32
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f">> Loading base pipeline from: {args.model_name_or_path}")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=dtype,
+        local_files_only=args.local_files_only,
+        safety_checker=None,
+        feature_extractor=None,
+    )
+
+    print(f">> Using tokenizer at: {args.tokenizer_dir}")
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir, use_fast=False)
+    pipe.tokenizer = tokenizer
+    new_vocab = len(tokenizer)
+    old_vocab = pipe.text_encoder.get_input_embeddings().num_embeddings
+    if new_vocab != old_vocab:
+        print(f"Resizing text encoder embeddings: {old_vocab} -> {new_vocab}")
+        pipe.text_encoder.resize_token_embeddings(new_vocab)
+
+    wrap_with_lora_te_and_unet(pipe, rank=8)
+
+    print(f">> Loading LoRA from: {args.lora_path}")
+    te_state, unet_state = load_split_lora_weights(args.lora_path)
+    missing_te, unexpected_te = pipe.text_encoder.load_state_dict(te_state, strict=False)
+    missing_unet, unexpected_unet = pipe.unet.load_state_dict(unet_state, strict=False)
+    print(f"Loaded TE LoRA (missing={len(missing_te)}, unexpected={len(unexpected_te)})")
+    print(f"Loaded UNet LoRA (missing={len(missing_unet)}, unexpected={len(unexpected_unet)})")
+
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=False)
+    try: pipe.enable_attention_slicing()
+    except Exception: pass
+    try: pipe.enable_vae_slicing()
+    except Exception: pass
+
+    prompt_embeds, negative_prompt_embeds = encode_prompts_with_peft_te(
+        pipe, tokenizer, args.prompt, args.negative_prompt, device, dtype
+    )
+
+    print(f">> Rendering {args.num_images} image(s) to: {args.output_dir}")
+    for i in range(args.num_images):
+        g = torch.Generator(device=device).manual_seed(args.seed + i)
+        out = pipe(
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance,
+            height=args.height,
+            width=args.width,
+            generator=g,
+        )
+        image = out.images[0]
+        path = os.path.join(args.output_dir, f"sks_{i:02d}.png")
+        image.save(path)
+        print("Saved:", path)
+
+if __name__ == "__main__":
+    main()
