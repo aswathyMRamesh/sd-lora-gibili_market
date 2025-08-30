@@ -1,44 +1,54 @@
-# sd-lora-gibili_market
-Fine-tune Stable Diffusion 1.5 with LoRA to create images in the Gibili_Market style.
+Ghibli Market · LoRA Style (SD 1.5)
 
-1 · DATASET
+This project fine-tunes Stable Diffusion 1.5 with LoRA to render images in <sks> style.
 
-original/ : full-resolution PNG/JPG reference images
+1. Setup
+Create environment
+    micromamba create -y -n sd-lora python=3.10
+    micromamba activate sd-lora
+    pip install -r requirements.txt
 
-512/ : 512 × 512 crops ready to train
+2. Add the <sks> token
+(Run once)
+    python code/add_token.py \
+  --model_name_or_path runwayml/stable-diffusion-v1-5 \
+  --token "<sks>" \
+  --output_dir ./artifacts/tokenizer
 
-dataset is added in the branch
+3. Training
+Online mode (auto-download from Hugging Face Hub)
+    python code/train_lora.py \
+  --model_name_or_path "runwayml/stable-diffusion-v1-5" \
+  --tokenizer_dir "./artifacts/tokenizer" \
+  --data_dir "./data/data/512" \
+  --output_dir "./lora_out" \
+  --batch_size 1 --max_steps 800 --log_every 10 --num_workers 0
+  
+Offline mode (local model)
+    python code/train_lora.py \
+  --model_name_or_path "./cache/sd15/sd15" \
+  --tokenizer_dir "./artifacts/tokenizer" \
+  --data_dir "./data/data/512" \
+  --output_dir "./lora_out" \
+  --batch_size 1 --max_steps 800 --log_every 10 --num_workers 0
 
-2 · TASK
+Output:
+    lora_out/pytorch_lora_weights.safetensors
 
-Add a new style token <sks> to the tokenizer.
+4. Evaluation / Sampling
+    python code/eval_lora.py \
+  --model_name_or_path "runwayml/stable-diffusion-v1-5" \
+  --tokenizer_dir "./artifacts/tokenizer" \
+  --lora_path "./lora_out/pytorch_lora_weights.safetensors" \
+  --output_dir "./samples" \
+  --num_images 3 --steps 30 --guidance 7.5 --seed 1234
 
-Finetune both the UNet and the text encoder with LoRA so that the prompt: "a busy market, in <sks> style" produces Ghibli-like images.
+Images will be saved under:
+    samples/sks_00.png
+    samples/sks_01.png
+    samples/sks_02.png
 
-3 · IMPLEMENTATION REQUIREMENTS
-
-Libraries: diffusers, peft, PyTorch 2+, safetensors
-
-Training script: code/train_lora.py (or notebook)
-
-• saves exactly one file → lora_out/pytorch_lora_weights.safetensors
-
-Evaluation script: code/eval_lora.py
-
-• loads base SD 1.5 and your adapter
-
-• renders at least three images for the prompt above (baseline optional)
-
-Suggested hyper-parameters (feel free to change):
-
-MODEL_NAME = runwayml/stable-diffusion-v1-5
-
-INSTANCE_TOKEN = <sks>
-
-RESOLUTION = 512 
-
-LORA_RANK = 8 
-
-LR = 1e-4 
-
-MAX_STEPS = 800
+5. Notes
+	•	For offline use, download SD 1.5 to ./cache/sd15/sd15 and include ./artifacts/tokenizer.
+	•	For reproducibility, keep the same seed, steps, guidance, and resolution.
+	•	Both text encoder and UNet LoRA weights are saved into one .safetensors file.
